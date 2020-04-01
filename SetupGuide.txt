@@ -1,0 +1,207 @@
+### For each new ubuntu lxc node ###
+##  For now run these commands individually ##
+# 	This will update the node; add some packages required to install mssql; start the setup wizard
+# 	Enable SQL Agent
+# 	Enable AlwaysOn
+sudo apt-get update
+sudo apt-get upgrade
+sudo apt-get -y install gnupg gnupg1 wget software-properties-common
+wget -qO- https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+sudo add-apt-repository "$(wget -qO- https://packages.microsoft.com/config/ubuntu/18.04/mssql-server-2019.list)"
+sudo apt-get update
+sudo apt-get install -y mssql-server
+sudo /opt/mssql/bin/mssql-conf setup
+sudo systemctl status mssql-server --no-pager
+sudo /opt/mssql/bin/mssql-conf set sqlagent.enabled true
+sudo systemctl restart mssql-server
+sudo /opt/mssql/bin/mssql-conf set hadr.hadrenabled 1
+sudo systemctl restart mssql-server
+
+### For each SQL Server Post Install ###
+## 	Setup the user that will managed the AG ##
+#  	Change Password #
+alter event session AlwaysOn_health on server with (startup_state=on);
+create login dbm_login with password = 'password!1';
+create user dbm_user for login dbm_login;
+
+
+###	SQL Server 1 ###
+##	Create the certificates that allow the servers to communicate ##
+##  Create the endpoint ##
+# 	Change passwords & Cert Names #
+create master key encryption by password = 'password!2';
+create certificate sql_cert with subject = 'AG SQL Certificate';
+backup certificate sql_cert
+to file = '/var/opt/mssql/data/sql_cert.cer'
+go
+create endpoint AGEndpoint state = started
+as tcp (listener_ip = all, listener_port = 5022)
+for data_mirroring (
+role = all,
+authentication = certificate sql_cert);
+go
+
+###	SQL Server 2 ###
+##	Create the certificates that allow the servers to communicate ##
+##  Create the endpoint ##
+# 	Change passwords & Cert Names #
+create master key encryption by password = 'password!2';
+create certificate sql2_cert with subject = 'AG SQL2 Certificate';
+backup certificate sql2_cert
+to file = '/var/opt/mssql/data/sql2_cert.cer'
+go
+create endpoint AGEndpoint state = started
+as tcp (listener_ip = all, listener_port = 5022)
+for data_mirroring (
+role = all,
+authentication = certificate sql2_cert);
+go
+
+###	SQL Server 3 ###
+##	Create the certificates that allow the servers to communicate ##
+##  Create the endpoint ##
+# 	Change passwords & Cert Names #
+create master key encryption by password = 'password!2';
+create certificate sql3_cert with subject = 'AG SQL3 Certificate';
+backup certificate sql3_cert
+to file = '/var/opt/mssql/data/sql3_cert.cer'
+go
+create endpoint AGEndpoint state = started
+as tcp (listener_ip = all, listener_port = 5022)
+for data_mirroring (
+role = all,
+authentication = certificate sql3_cert);
+go
+
+
+###	SQL Server 1 ###
+## Secure Copy Certs to the other nodes ##
+sudo scp /var/opt/mssql/data/sql_cert.cer ubuntu@sql2:/home/ubuntu
+sudo scp /var/opt/mssql/data/sql_cert.cer ubuntu@sql3:/home/ubuntu
+###	SQL Server 2 ###
+sudo mv sql_cert.cer /var/opt/mssql/data/
+sudo chown mssql. /var/opt/mssql/data/sql_cert.cer
+###	SQL Server 3 ###
+sudo mv sql_cert.cer /var/opt/mssql/data/
+sudo chown mssql. /var/opt/mssql/data/sql_cert.cer
+
+
+###	SQL Server 2 ###
+## Secure Copy Certs to the other nodes ##
+sudo scp /var/opt/mssql/data/sql2_cert.cer ubuntu@sql:/home/ubuntu
+sudo scp /var/opt/mssql/data/sql2_cert.cer ubuntu@sql3:/home/ubuntu
+###	SQL Server 1 ###
+sudo mv sql2_cert.cer /var/opt/mssql/data/
+sudo chown mssql. /var/opt/mssql/data/sql2_cert.cer
+###	SQL Server 3 ###
+sudo mv sql2_cert.cer /var/opt/mssql/data/
+sudo chown mssql. /var/opt/mssql/data/sql2_cert.cer
+
+###	SQL Server 3 ###
+## Secure Copy Certs to the other nodes ##
+sudo scp /var/opt/mssql/data/sql3_cert.cer ubuntu@sql:/home/ubuntu
+sudo scp /var/opt/mssql/data/sql3_cert.cer ubuntu@sql2:/home/ubuntu
+###	SQL Server 1 ###
+sudo mv sql3_cert.cer /var/opt/mssql/data/
+sudo chown mssql. /var/opt/mssql/data/sql3_cert.cer
+###	SQL Server 2 ###
+sudo mv sql3_cert.cer /var/opt/mssql/data/
+sudo chown mssql. /var/opt/mssql/data/sql3_cert.cer
+
+###	SQL Server 1 ###
+## 	Enable the copied certs ##
+create certificate sql2_cert authorization dbm_user
+from file = '/var/opt/mssql/data/sql2_cert.cer'
+go
+create certificate sql3_cert authorization dbm_user
+from file = '/var/opt/mssql/data/sql3_cert.cer'
+go
+grant connect on endpoint::AGEndpoint to dbm_login;
+go
+
+###	SQL Server 2 ###
+## 	Enable the copied certs ##
+create certificate sql_cert authorization dbm_user
+from file = '/var/opt/mssql/data/sql_cert.cer'
+go
+create certificate sql3_cert authorization dbm_user
+from file = '/var/opt/mssql/data/sql3_cert.cer'
+go
+grant connect on endpoint::AGEndpoint to dbm_login;
+go
+
+###	SQL Server 3 ###
+## 	Enable the copied certs ##
+create certificate sql_cert authorization dbm_user
+from file = '/var/opt/mssql/data/sql_cert.cer'
+go
+create certificate sql2_cert authorization dbm_user
+from file = '/var/opt/mssql/data/sql2_cert.cer'
+go
+grant connect on endpoint::AGEndpoint to dbm_login;
+go
+
+###	SQL Server 1 ###
+## Create the Read-Scale AG ##
+# Change server names and ip's #
+create availability group [AG]
+with (cluster_type = none)
+for replica on
+N'sql' with (
+endpoint_url = N'tcp://192.168.2.150:5022',
+availability_mode = asynchronous_commit,
+failover_mode = manual,
+seeding_mode = automatic,
+primary_role (read_only_routing_list=(('sql2','sql3'), 'sql')),
+secondary_role (
+allow_connections = read_only,
+read_only_routing_url = N'tcp://192.168.2.150:1433')),
+N'sql2' with (
+endpoint_url = N'tcp://192.168.2.151:5022',
+availability_mode = asynchronous_commit,
+failover_mode = manual,
+seeding_mode = automatic,
+primary_role (read_only_routing_list=(('sql','sql3'), 'sql2')),
+secondary_role (
+allow_connections = read_only,
+read_only_routing_url = N'tcp://192.168.2.151:1433')),
+N'sql3' with (
+endpoint_url = N'tcp://192.168.2.152:5022',
+availability_mode = asynchronous_commit,
+failover_mode = manual,
+seeding_mode = automatic,
+primary_role (read_only_routing_list=(('sql','sql2'), 'sql3')),
+secondary_role (
+allow_connections = read_only,
+read_only_routing_url = N'tcp://192.168.2.152:1433'));
+alter availability group [AG] grant create any database;
+go
+
+###	SQL Server 2 ###
+##	Join AG ##
+alter availability group [AG] join with (cluster_type = none);
+alter availability group [AG] grant create any database;
+
+###	SQL Server 3 ###
+##	Join AG ##
+alter availability group [AG] join with (cluster_type = none);
+alter availability group [AG] grant create any database;
+
+###	SQL Server 1 ###
+##	Add listener ##
+alter availability group [AG] add listener 'AG01_listener'
+( with ip (
+('192.168.2.150', '255.255.255.0') ),
+port = 1433);
+go
+
+## Create first DB ##
+create database [Test];
+alter database [Test] set recovery full;
+backup database [Test] to disk = N'/var/opt/mssql/data/Test.bak';
+alter availability group [AG] add database [Test];
+
+###	SQL Server 1 & 2 & 3 ###
+##	Verify ##
+select L.replica_id,L.replica_server_name,R.role_desc from sys.availability_replicas as L
+left join sys.dm_hadr_availability_replica_states as R on L.replica_id = R.replica_id
